@@ -16,6 +16,7 @@
 */
 
 const id = 'signalk-mqtt-gw';
+const COMMAND_SUFFIX = '/set';
 const mqtt = require('mqtt');
 const { Manager } = require("mqtt-jsonl-store");
 
@@ -130,6 +131,12 @@ module.exports = function createPlugin(app) {
         type: 'number',
         title: 'Local server port',
         default: 1883,
+      },
+      enableLocalCommands: {
+        type: 'boolean',
+        title: 'Enable local command topics for Signal K PUT requests',
+        description: 'Treat client publishes to <state-topic>/set as Signal K PUT requests instead of state deltas.',
+        default: false,
       },
       sendToRemote: {
         type: 'boolean',
@@ -274,9 +281,13 @@ module.exports = function createPlugin(app) {
     aedes.on('publish', async function(packet, client) {
       app.debug('Published', packet.topic, packet.payload.toString());
       if (client) {
-        var skData = extractSkData(packet);
-        if (skData.valid) {
-          app.handleMessage(id, toDelta(skData, client));
+        if (options.enableLocalCommands && packet.topic.endsWith(COMMAND_SUFFIX)) {
+          handleCommandPublish(packet);
+        } else {
+          var skData = extractSkData(packet);
+          if (skData.valid) {
+            app.handleMessage(id, toDelta(skData, client));
+          }
         }
       }
     });
@@ -330,25 +341,95 @@ module.exports = function createPlugin(app) {
     }
   }
 
-  function extractSkData(packet) {
+  function topicToSkPath(topic) {
     const result = {
       valid: false,
     };
-    const pathParts = packet.topic.split('/');
+    const pathParts = topic.split('/');
     if (
       pathParts.length < 3 ||
-      pathParts[0] != 'vessels' ||
-      pathParts[1] != 'self'
+      pathParts[0] !== 'vessels' ||
+      pathParts[1] !== 'self'
     ) {
       return result;
     }
+    result.valid = true;
     result.context = 'vessels.' + app.selfId;
-    result.path = pathParts.splice(2).join('.');
-    if (packet.payload) {
+    result.path = pathParts.slice(2).join('.');
+    return result;
+  }
+
+  function extractSkData(packet) {
+    const result = topicToSkPath(packet.topic);
+    if (result.valid && packet.payload) {
       result.value = Number(packet.payload.toString());
     }
-    result.valid = true;
     return result;
+  }
+
+  function handleCommandPublish(packet) {
+    const stateTopic = packet.topic.slice(0, -COMMAND_SUFFIX.length);
+    const sk = topicToSkPath(stateTopic);
+    if (!sk.valid) {
+      app.debug('command topic does not map to a valid SK path: %s', packet.topic);
+      return;
+    }
+
+    const parsed = parseCommandPayload(packet.payload);
+    if (parsed.value === undefined) {
+      app.debug('command payload missing value for %s: %s', packet.topic, packet.payload.toString());
+      return;
+    }
+
+    app.debug('PUT %s = %j (source=%s)', sk.path, parsed.value, parsed.source);
+    try {
+      app.putSelfPath(sk.path, parsed.value, function (reply) {
+        app.debug('PUT update %s: %j', sk.path, reply);
+      }, parsed.source)
+        .then(function (reply) {
+          app.debug('PUT result %s: %j', sk.path, reply);
+        })
+        .catch(function (err) {
+          console.error('PUT error for ' + sk.path + ':', err.message || err);
+        });
+    } catch (err) {
+      console.error('failed to dispatch PUT for ' + sk.path + ':', err.message || err);
+    }
+  }
+
+  function parseCommandPayload(payload) {
+    const raw = payload ? payload.toString().trim() : '';
+    if (raw.startsWith('{') || raw.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (
+          parsed &&
+          typeof parsed === 'object' &&
+          !Array.isArray(parsed) &&
+          Object.prototype.hasOwnProperty.call(parsed, 'value')
+        ) {
+          return { value: parsed.value, source: parsed.source };
+        }
+        return { value: parsed, source: undefined };
+      } catch (e) {}
+    }
+    return { value: coerceCommandValue(raw), source: undefined };
+  }
+
+  function coerceCommandValue(v) {
+    if (v === undefined || v === null) return undefined;
+    if (typeof v === 'number' || typeof v === 'boolean') return v;
+    if (typeof v === 'object') return v;
+    const s = String(v).trim();
+    if (s === '') return undefined;
+    const lower = s.toLowerCase();
+    if (lower === 'true') return true;
+    if (lower === 'false') return false;
+    if (lower === 'on') return 1;
+    if (lower === 'off') return 0;
+    const n = Number(s);
+    if (!Number.isNaN(n)) return n;
+    return s;
   }
 
   function toDelta(skData, client) {

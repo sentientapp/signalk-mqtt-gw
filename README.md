@@ -4,6 +4,7 @@ Signal K Node server plugin that functions as a gateway between MQTT and SK serv
 
 ## Local MQTT broker/server
 - All SK deltas data available from broker/server. The server is advertised via mdns/Bonjour if available
+- Optionally treat client publishes on `<state-topic>/set` as Signal K PUT requests. Lets external MQTT clients (e.g. Home Assistant) control PUT-capable paths.
 ## MQTT Client
 - Send user selectable deltas (vessels.self, all deltas, JSON deltas from selectable paths or alldetas and JSON deltas) to remote broker/server
 
@@ -24,4 +25,32 @@ $ mosquitto_sub -h localhost -p 1884 -t 'vessels/self/navigation/speedOverGround
 3.58
 3.59
 3.59
+```
+
+## Sending PUT requests via the local broker (optional)
+
+**Enable local command topics for Signal K PUT requests** in the
+plugin config. Once enabled, client publishes to a topic ending in
+`/set` are dispatched as Signal K PUT requests instead of being treated
+as state deltas.
+
+```bash
+mosquitto_pub -h localhost -p 1883 \
+  -t 'vessels/self/electrical/switches/bank/42/12/state/set' -m 'on'
+```
+
+The topic mirrors the Signal K path with `/` instead of `.`, plus the
+`/set` suffix. PUTs only succeed on paths that have a registered PUT
+handler (e.g. via [signalk-n2k-switching](https://github.com/sbender9/signalk-n2k-switching)).
+
+### Example: Home Assistant MQTT switch
+
+```yaml
+mqtt:
+  switch:
+    - name: "Anchor Light"
+      state_topic: "vessels/self/electrical/switches/bank/42/12/state"
+      command_topic: "vessels/self/electrical/switches/bank/42/12/state/set"
+      payload_on: "1"
+      payload_off: "0"
 ```
